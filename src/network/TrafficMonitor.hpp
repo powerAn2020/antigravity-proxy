@@ -1,5 +1,5 @@
 #pragma once
-#include <winsock2.h>
+#include "../platform/PlatformCompat.hpp"
 #include <string>
 #include "../core/Logger.hpp"
 #include "../core/Config.hpp"

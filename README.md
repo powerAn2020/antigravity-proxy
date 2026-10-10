@@ -11,7 +11,7 @@
 <p align="center">
   <a href="https://github.com/yuaotian/antigravity-proxy/actions"><img src="https://github.com/yuaotian/antigravity-proxy/actions/workflows/build.yml/badge.svg" alt="Build Status"/></a>
   <a href="LICENSE.txt"><img src="https://img.shields.io/badge/license-BSD--2--Clause-blue.svg" alt="License"/></a>
-  <img src="https://img.shields.io/badge/platform-Windows%20x86%20%7C%20x64-lightgrey.svg" alt="Platform"/>
+  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey.svg" alt="Platform"/>
   <img src="https://img.shields.io/badge/C%2B%2B-17-00599C.svg" alt="C++17"/>
   <img src="https://img.shields.io/badge/hook-MinHook-orange.svg" alt="MinHook"/>
 </p>
@@ -637,6 +637,40 @@ Get-NetAdapterBinding -ComponentID ms_tcpip6
 
 # 查看帮助
 .\build.ps1 -Help
+```
+
+### Linux 一键编译与安装 / Linux Quick Build & Install
+
+本项目已原生支持 Linux 平台（支持 x86_64 及 aarch64 架构，无缝支持 WSL、原生 Linux 服务器与桌面）：
+
+```bash
+# 1. 安装编译环境 (Debian / Ubuntu)
+sudo apt update && sudo apt install -y build-essential cmake ninja-build
+
+# 2. 一键编译与打包
+./build.sh
+
+# 3. 安装到系统路径 (/usr/local/bin 与 /usr/local/lib)
+sudo ./build.sh --install
+```
+
+编译产物位于 `output/linux/`：
+- `libantigravity_proxy.so`：基于 `LD_PRELOAD` 的网络重定向动态库，自动接管 `connect`、`getaddrinfo` 及多层子进程派生 (`execve`)。
+- `antigravity-proxy`：原生命令行管理工具，支持一键运行 `agy`、检查状态及测试连通性。
+- `config.json`：代理配置文件。
+
+#### Linux 快速启动方式
+
+```bash
+# 方式 A：通过 antigravity-proxy 工具直接启动 CLI
+antigravity-proxy agy
+
+# 方式 B：通过 antigravity-proxy 包装任意命令
+antigravity-proxy run curl -I https://www.google.com
+
+# 方式 C：在当前终端会话中全局生效
+eval "$(antigravity-proxy env)"
+agy
 ```
 
 ### 手动编译 / Manual Build

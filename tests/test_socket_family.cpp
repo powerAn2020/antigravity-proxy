@@ -1,9 +1,4 @@
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-
-#include <winsock2.h>
-#include <ws2tcpip.h>
+#include "platform/PlatformCompat.hpp"
 
 // 回归测试在 Release 构建下也必须执行断言。
 #ifdef NDEBUG
@@ -27,8 +22,8 @@ int main() {
            result == Network::DualStackResult::AlreadyEnabled);
     assert(error == 0);
 
-    DWORD v6Only = 1;
-    int optionLength = static_cast<int>(sizeof(v6Only));
+    int v6Only = 1;
+    socklen_compat_t optionLength = static_cast<socklen_compat_t>(sizeof(v6Only));
     assert(getsockopt(
                socket6,
                IPPROTO_IPV6,
@@ -39,10 +34,10 @@ int main() {
 
     sockaddr_in6 mapped{};
     mapped.sin6_family = AF_INET6;
-    mapped.sin6_addr.u.Byte[10] = 0xff;
-    mapped.sin6_addr.u.Byte[11] = 0xff;
-    mapped.sin6_addr.u.Byte[12] = 127;
-    mapped.sin6_addr.u.Byte[15] = 1;
+    mapped.sin6_addr.s6_addr[10] = 0xff;
+    mapped.sin6_addr.s6_addr[11] = 0xff;
+    mapped.sin6_addr.s6_addr[12] = 127;
+    mapped.sin6_addr.s6_addr[15] = 1;
     assert(Network::IsIpv4MappedAddress(mapped));
 
     sockaddr_in6 native{};

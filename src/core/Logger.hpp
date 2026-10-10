@@ -6,15 +6,11 @@
 #include <algorithm>
 #include <cctype>
 #include <iostream>
-
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-
 #include <ctime>
 #include <iomanip>
 #include <sstream>
+
+#include "../platform/PlatformCompat.hpp"
 
 namespace Core {
     // 日志等级（用于控制输出粒度：默认 Info；需要更细粒度排障时可切到 Debug）
@@ -64,6 +60,7 @@ namespace Core {
             return false;
         }
 
+#ifdef _WIN32
         // ========== 跨进程互斥（用于多进程注入场景下的日志一致性） ==========
         // 设计意图：序列化“检查大小→必要时截断→写入”这一段，避免多进程互相截断或写入交错。
         static HANDLE GetCrossProcessLogMutex() {
@@ -75,11 +72,13 @@ namespace Core {
             });
             return s_mutex;
         }
+#endif
 
         // ========== 日志目录相关函数 ==========
         
-        // 获取 DLL 所在目录（用于定位日志目录）
+        // 获取模块/动态库所在目录（用于定位日志目录）
         static std::string GetDllDirectory() {
+#ifdef _WIN32
             char modulePath[MAX_PATH] = {0};
             HMODULE hModule = NULL;
             // 通过函数地址获取当前 DLL 的模块句柄
@@ -101,20 +100,40 @@ namespace Core {
                 }
             }
             return std::string(modulePath);
+#else
+            Dl_info dl_info;
+            if (dladdr(reinterpret_cast<void*>(&GetDllDirectory), &dl_info) && dl_info.dli_fname) {
+                std::string path = dl_info.dli_fname;
+                size_t lastSlash = path.find_last_of('/');
+                if (lastSlash != std::string::npos) {
+                    return path.substr(0, lastSlash);
+                }
+            }
+            return "";
+#endif
         }
 
         // 确保目录存在，不存在则创建
         static bool EnsureLogDirectory(const std::string& dirPath) {
+#ifdef _WIN32
             DWORD attr = GetFileAttributesA(dirPath.c_str());
             if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
                 return true; // 目录已存在
             }
             // 尝试创建目录
             return CreateDirectoryA(dirPath.c_str(), NULL) != 0;
+#else
+            struct stat st;
+            if (stat(dirPath.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+                return true;
+            }
+            return mkdir(dirPath.c_str(), 0755) == 0;
+#endif
         }
 
         // 获取系统临时目录路径
         static std::string GetSystemTempDirectory() {
+#ifdef _WIN32
             char tempPath[MAX_PATH] = {0};
             DWORD len = GetTempPathA(MAX_PATH, tempPath);
             if (len == 0 || len >= MAX_PATH) {
@@ -125,19 +144,28 @@ namespace Core {
                 tempPath[len - 1] = '\0';
             }
             return std::string(tempPath);
+#else
+            const char* tmp = getenv("TMPDIR");
+            if (tmp && *tmp) return std::string(tmp);
+            return "/tmp";
+#endif
         }
 
         // 获取日志目录路径，首次调用时初始化
-        // 优先级：DLL目录/logs/ → 系统TEMP目录/antigravity-proxy-logs/
+        // 优先级：动态库目录/logs/ → 系统TEMP目录/antigravity-proxy-logs/
         static std::string GetLogDirectory() {
             static std::string s_logDir;
             static bool s_initialized = false;
             if (!s_initialized) {
                 s_initialized = true;
-                // 优先尝试 DLL 目录下的 logs 子目录
+                // 优先尝试库目录下的 logs 子目录
                 std::string dllDir = GetDllDirectory();
                 if (!dllDir.empty()) {
+#ifdef _WIN32
                     std::string dllLogs = dllDir + "\\logs";
+#else
+                    std::string dllLogs = dllDir + "/logs";
+#endif
                     if (EnsureLogDirectory(dllLogs)) {
                         s_logDir = dllLogs;
                         return s_logDir;
@@ -146,7 +174,11 @@ namespace Core {
                 // 回退到系统 TEMP 目录
                 std::string tempDir = GetSystemTempDirectory();
                 if (!tempDir.empty()) {
+#ifdef _WIN32
                     std::string tempLogs = tempDir + "\\antigravity-proxy-logs";
+#else
+                    std::string tempLogs = tempDir + "/antigravity-proxy-logs";
+#endif
                     if (EnsureLogDirectory(tempLogs)) {
                         s_logDir = tempLogs;
                     }
@@ -156,12 +188,16 @@ namespace Core {
             return s_logDir;
         }
 
-        // ========== 原有辅助函数 ==========
+        // ========== 辅助函数 ==========
         
         static std::string GetTimestamp() {
             auto now = std::time(nullptr);
-            struct tm tm;
+            struct tm tm{};
+#ifdef _WIN32
             localtime_s(&tm, &now);
+#else
+            localtime_r(&now, &tm);
+#endif
             std::ostringstream oss;
             oss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S");
             return oss.str();
@@ -174,42 +210,48 @@ namespace Core {
             return "[PID:" + std::to_string(pid) + "][TID:" + std::to_string(tid) + "]";
         }
 
-        // 获取今日日志文件完整路径（如：C:\xxx\logs\proxy-20260111.log）
+        // 获取今日日志文件完整路径
         static std::string GetTodayLogName() {
             auto now = std::time(nullptr);
-            struct tm tm;
+            struct tm tm{};
+#ifdef _WIN32
             localtime_s(&tm, &now);
+#else
+            localtime_r(&now, &tm);
+#endif
             std::ostringstream oss;
-            // 优先使用 DLL 目录下的 logs 子目录
             std::string logDir = GetLogDirectory();
             if (!logDir.empty()) {
+#ifdef _WIN32
                 oss << logDir << "\\";
+#else
+                oss << logDir << "/";
+#endif
             }
             oss << "proxy-" << std::put_time(&tm, "%Y%m%d") << ".log";
             return oss.str();
         }
 
-        static bool IsLogOverLimit(const std::string& path, ULONGLONG maxBytes) {
-            WIN32_FILE_ATTRIBUTE_DATA data{};
-            if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &data)) {
-                return false;
-            }
-            ULONGLONG size = (static_cast<ULONGLONG>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
-            return size >= maxBytes;
-        }
-
         static ULONGLONG GetFileSizeBytes(const std::string& path) {
+#ifdef _WIN32
             WIN32_FILE_ATTRIBUTE_DATA data{};
             if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &data)) {
                 return 0;
             }
             return (static_cast<ULONGLONG>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+#else
+            struct stat st;
+            if (stat(path.c_str(), &st) != 0) {
+                return 0;
+            }
+            return static_cast<ULONGLONG>(st.st_size);
+#endif
         }
 
         // 清理旧日志文件，只保留当天的日志
         static void CleanupOldLogs(const std::string& todayLog) {
             std::string logDir = GetLogDirectory();
-            // 构建搜索模式（支持有/无日志目录两种情况）
+#ifdef _WIN32
             std::string searchPattern = logDir.empty() 
                 ? "proxy-*.log" 
                 : (logDir + "\\proxy-*.log");
@@ -221,33 +263,52 @@ namespace Core {
                     if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
                         continue;
                     }
-                    // 构建找到文件的完整路径
                     std::string fullPath = logDir.empty() 
                         ? std::string(findData.cFileName) 
                         : (logDir + "\\" + findData.cFileName);
                     
-                    // 保留今天的日志，删除其他日期的
                     if (todayLog != fullPath) {
                         DeleteFileA(fullPath.c_str());
                     }
                 } while (FindNextFileA(hFind, &findData));
                 FindClose(hFind);
             }
-            // 清理旧版日志文件（无日期后缀的遗留文件）
             std::string oldLog = logDir.empty() ? "proxy.log" : (logDir + "\\proxy.log");
             std::string oldLog1 = logDir.empty() ? "proxy.log.1" : (logDir + "\\proxy.log.1");
             if (todayLog != oldLog) {
                 DeleteFileA(oldLog.c_str());
             }
             DeleteFileA(oldLog1.c_str());
+#else
+            std::string dirPath = logDir.empty() ? "." : logDir;
+            DIR* d = opendir(dirPath.c_str());
+            if (d) {
+                struct dirent* entry = nullptr;
+                while ((entry = readdir(d)) != nullptr) {
+                    std::string name = entry->d_name;
+                    if (name.rfind("proxy-", 0) == 0 && name.size() >= 10 && name.substr(name.size() - 4) == ".log") {
+                        std::string fullPath = logDir.empty() ? name : (logDir + "/" + name);
+                        if (todayLog != fullPath) {
+                            unlink(fullPath.c_str());
+                        }
+                    }
+                }
+                closedir(d);
+            }
+            std::string oldLog = logDir.empty() ? "proxy.log" : (logDir + "/proxy.log");
+            std::string oldLog1 = logDir.empty() ? "proxy.log.1" : (logDir + "/proxy.log.1");
+            if (todayLog != oldLog) {
+                unlink(oldLog.c_str());
+            }
+            unlink(oldLog1.c_str());
+#endif
         }
 
         static void WriteToFile(const std::string& message) {
-            // 按日期写日志并清理旧文件，避免历史日志堆积
             static std::string s_todayLog;
-            // 需求：单文件 10MB 达到即覆盖写入（不轮转、不备份）
             static const ULONGLONG kMaxLogBytes = 10ull * 1024 * 1024; // 10MB
 
+#ifdef _WIN32
             // 多进程注入场景：使用跨进程互斥量保证“检查+截断+写入”的原子性
             HANDLE hMutex = GetCrossProcessLogMutex();
             DWORD waitRc = WAIT_FAILED;
@@ -256,7 +317,6 @@ namespace Core {
             }
             const bool locked = (hMutex != NULL) && (waitRc == WAIT_OBJECT_0 || waitRc == WAIT_ABANDONED);
 
-            // 如果跨进程互斥不可用，退化为进程内互斥，保证不崩溃（但多进程一致性会弱一些）
             static std::mutex s_fallbackMtx;
             std::unique_lock<std::mutex> fallbackLock;
             if (!locked) {
@@ -269,7 +329,6 @@ namespace Core {
                 CleanupOldLogs(s_todayLog);
             }
 
-            // 判断本次写入是否会超过上限；超过则直接截断覆盖写入
             const ULONGLONG currentSize = GetFileSizeBytes(s_todayLog);
             const ULONGLONG appendBytes = static_cast<ULONGLONG>(message.size() + 1); // + '\n'
             const bool needTruncate = (currentSize > 0 && (currentSize + appendBytes) > kMaxLogBytes);
@@ -287,9 +346,34 @@ namespace Core {
             if (locked) {
                 ReleaseMutex(hMutex);
             }
+#else
+            static std::mutex s_logMtx;
+            std::lock_guard<std::mutex> lock(s_logMtx);
+
+            std::string todayLog = GetTodayLogName();
+            if (s_todayLog != todayLog) {
+                s_todayLog = todayLog;
+                CleanupOldLogs(s_todayLog);
+            }
+
+            const ULONGLONG currentSize = GetFileSizeBytes(s_todayLog);
+            const ULONGLONG appendBytes = static_cast<ULONGLONG>(message.size() + 1);
+            const bool needTruncate = (currentSize > 0 && (currentSize + appendBytes) > kMaxLogBytes);
+
+            FILE* fp = fopen(s_todayLog.c_str(), needTruncate ? "w" : "a");
+            if (fp) {
+                int fd = fileno(fp);
+                flock(fd, LOCK_EX);
+                fputs((message + "\n").c_str(), fp);
+                fflush(fp);
+                flock(fd, LOCK_UN);
+                fclose(fp);
+            }
+#endif
         }
 
         static void TryWriteAtProcessDetach(const std::string& message) {
+#ifdef _WIN32
             // DllMain 的进程终止分支不能等待其他进程或本进程线程持有的日志锁。
             HANDLE hMutex = GetCrossProcessLogMutex();
             const DWORD waitRc = hMutex ? WaitForSingleObject(hMutex, 0) : WAIT_FAILED;
@@ -329,6 +413,9 @@ namespace Core {
             if (!written) {
                 OutputDebugStringA((message + "\n").c_str());
             }
+#else
+            WriteToFile(message);
+#endif
         }
 
     public:

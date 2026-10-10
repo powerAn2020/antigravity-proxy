@@ -1,4 +1,5 @@
 #pragma once
+#include "../platform/PlatformCompat.hpp"
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <string>
@@ -610,8 +611,9 @@ namespace Core {
             return s;
         }
 
-        // 判断路径是否为绝对路径（Windows 盘符或 UNC 路径）
+        // 判断路径是否为绝对路径
         static bool IsAbsolutePath(const std::string& path) {
+#ifdef _WIN32
             if (path.size() >= 2 && std::isalpha(static_cast<unsigned char>(path[0])) && path[1] == ':') {
                 return true;
             }
@@ -620,10 +622,14 @@ namespace Core {
                 return true;
             }
             return false;
+#else
+            return !path.empty() && path[0] == '/';
+#endif
         }
 
-        // 获取当前 DLL 所在目录（用于定位与 DLL 同目录的配置文件）
+        // 获取当前库所在目录（用于定位同目录配置文件）
         static std::string GetModuleDirectory() {
+#ifdef _WIN32
             char modulePath[MAX_PATH] = {0};
             HMODULE hModule = NULL;
             if (!GetModuleHandleExA(
@@ -644,6 +650,17 @@ namespace Core {
                 }
             }
             return std::string(modulePath);
+#else
+            Dl_info dl_info;
+            if (dladdr(reinterpret_cast<void*>(&GetModuleDirectory), &dl_info) && dl_info.dli_fname) {
+                std::string path = dl_info.dli_fname;
+                size_t lastSlash = path.find_last_of('/');
+                if (lastSlash != std::string::npos) {
+                    return path.substr(0, lastSlash);
+                }
+            }
+            return "";
+#endif
         }
 
     public:
@@ -679,6 +696,13 @@ namespace Core {
                 if (lowerName == lowerTarget) return true;
                 // 支持类似 "language_server_windows" 匹配 "language_server_windows.exe"
                 if (lowerName.find(lowerTarget) != std::string::npos) return true;
+                // 支持去除 .exe 后在 Linux 下匹配
+                if (lowerTarget.size() > 4 && lowerTarget.rfind(".exe") == lowerTarget.size() - 4) {
+                    std::string withoutExe = lowerTarget.substr(0, lowerTarget.size() - 4);
+                    if (lowerName == withoutExe || lowerName.find(withoutExe) != std::string::npos) {
+                        return true;
+                    }
+                }
             }
             return false;
         }
@@ -691,6 +715,12 @@ namespace Core {
                 if (lowerItem.empty()) continue;
                 if (lowerName == lowerItem) return true;
                 if (lowerName.find(lowerItem) != std::string::npos) return true;
+                if (lowerItem.size() > 4 && lowerItem.rfind(".exe") == lowerItem.size() - 4) {
+                    std::string withoutExe = lowerItem.substr(0, lowerItem.size() - 4);
+                    if (lowerName == withoutExe || lowerName.find(withoutExe) != std::string::npos) {
+                        return true;
+                    }
+                }
             }
             return false;
         }
@@ -710,16 +740,29 @@ namespace Core {
 
         bool Load(const std::string& path = "config.json") {
             try {
-                // 优先从 DLL 所在目录读取配置，避免子进程工作目录不同导致相对路径失效
+                // 优先从环境变量、动态库目录读取配置，避免子进程工作目录不同导致相对路径失效
                 std::vector<std::string> candidates;
+                if (const char* envPath = getenv("ANTIGRAVITY_PROXY_CONFIG")) {
+                    if (*envPath) candidates.push_back(envPath);
+                }
                 if (IsAbsolutePath(path)) {
                     candidates.push_back(path);
                 } else {
                     std::string dllDir = GetModuleDirectory();
                     if (!dllDir.empty()) {
+#ifdef _WIN32
                         candidates.push_back(dllDir + "\\" + path);
+#else
+                        candidates.push_back(dllDir + "/" + path);
+#endif
                     }
                     candidates.push_back(path);
+#ifndef _WIN32
+                    if (const char* home = getenv("HOME")) {
+                        candidates.push_back(std::string(home) + "/.config/antigravity-proxy/" + path);
+                    }
+                    candidates.push_back("/etc/antigravity-proxy/" + path);
+#endif
                 }
 
                 std::ifstream f;

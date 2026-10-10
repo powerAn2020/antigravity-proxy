@@ -1,6 +1,5 @@
 #pragma once
-#include <winsock2.h>
-#include <ws2tcpip.h>
+#include "../platform/PlatformCompat.hpp"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -72,7 +71,7 @@ namespace Network {
         inline bool CopyPeerIpAsRelay(SOCKET tcpSock, uint16_t relayPort, sockaddr_storage* out, int* outLen) {
             if (!out || !outLen) return false;
             sockaddr_storage peer{};
-            int peerLen = (int)sizeof(peer);
+            socklen_compat_t peerLen = static_cast<socklen_compat_t>(sizeof(peer));
             if (getpeername(tcpSock, (sockaddr*)&peer, &peerLen) != 0) {
                 return false;
             }

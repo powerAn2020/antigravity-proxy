@@ -1,6 +1,5 @@
 #pragma once
-#include <winsock2.h>
-#include <ws2tcpip.h>
+#include "../platform/PlatformCompat.hpp"
 #include <cstdint>
 #include <chrono>
 #include <limits>
@@ -34,7 +33,7 @@ inline int RemainingTimeoutMs(const std::chrono::steady_clock::time_point& deadl
     return static_cast<int>(remainMs);
 }
 
-// 使用 select 等待可读/可写，避免非阻塞套接字直接失败
+// 使用 select 等待可读，避免非阻塞套接字直接失败
 inline bool WaitReadable(SOCKET sock, int timeoutMs) {
     if (sock == INVALID_SOCKET) {
         WSASetLastError(WSAEINVAL);
@@ -47,7 +46,7 @@ inline bool WaitReadable(SOCKET sock, int timeoutMs) {
     timeval tv{};
     tv.tv_sec = timeoutMs / 1000;
     tv.tv_usec = (timeoutMs % 1000) * 1000;
-    int rc = select(0, &readSet, nullptr, nullptr, &tv);
+    int rc = select((int)sock + 1, &readSet, nullptr, nullptr, &tv);
     if (rc > 0) return true;
     if (rc == 0) WSASetLastError(WSAETIMEDOUT);
     return false;
@@ -66,7 +65,7 @@ inline bool WaitWritable(SOCKET sock, int timeoutMs) {
     timeval tv{};
     tv.tv_sec = timeoutMs / 1000;
     tv.tv_usec = (timeoutMs % 1000) * 1000;
-    int rc = select(0, nullptr, &writeSet, nullptr, &tv);
+    int rc = select((int)sock + 1, nullptr, &writeSet, nullptr, &tv);
     if (rc > 0) return true;
     if (rc == 0) WSASetLastError(WSAETIMEDOUT);
     return false;
@@ -76,7 +75,7 @@ inline bool WaitWritable(SOCKET sock, int timeoutMs) {
 inline bool WaitConnect(SOCKET sock, int timeoutMs) {
     if (!WaitWritable(sock, timeoutMs)) return false;
     int soError = 0;
-    int optLen = sizeof(soError);
+    socklen_compat_t optLen = sizeof(soError);
     if (getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&soError, &optLen) != 0) {
         return false;
     }

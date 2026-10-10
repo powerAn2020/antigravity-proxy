@@ -48,6 +48,7 @@ Ankh.NoLoad
 #输出文件
 output/
 log/
+build_linux/
 
 *.zip
 *.7z

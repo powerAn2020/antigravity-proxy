@@ -1,6 +1,5 @@
 #pragma once
-#include <winsock2.h>
-#include <ws2tcpip.h>
+#include "../platform/PlatformCompat.hpp"
 #include <chrono>
 #include <limits>
 #include <string>

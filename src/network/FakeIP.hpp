@@ -3,15 +3,13 @@
 #include <unordered_map>
 #include <mutex>
 #include <vector>
-#include <winsock2.h>
-#include <ws2tcpip.h>
 #include <sstream>
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
 #include <cstring>
 #include <cstdint>
+#include <string_view>
+#include <charconv>
+
+#include "../platform/PlatformCompat.hpp"
 #include "../core/Config.hpp"
 #include "../core/Logger.hpp"
 
@@ -51,23 +49,37 @@ namespace Network {
             SharedEntry entries[kSharedCapacity];
         };
 
+#ifdef _WIN32
         HANDLE m_sharedMap = NULL;
         HANDLE m_sharedMutex = NULL;
+#else
+        int m_sharedFd = -1;
+#endif
         SharedTable* m_shared = nullptr;
         std::once_flag m_sharedOnce;
 
         bool LockShared() {
+#ifdef _WIN32
             if (!m_sharedMutex) return false;
             DWORD wait = WaitForSingleObject(m_sharedMutex, INFINITE);
             return (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED);
+#else
+            if (m_sharedFd < 0) return false;
+            return flock(m_sharedFd, LOCK_EX) == 0;
+#endif
         }
 
         void UnlockShared() {
+#ifdef _WIN32
             if (m_sharedMutex) ReleaseMutex(m_sharedMutex);
+#else
+            if (m_sharedFd >= 0) flock(m_sharedFd, LOCK_UN);
+#endif
         }
 
         void EnsureSharedInitialized() {
             std::call_once(m_sharedOnce, [this]() {
+#ifdef _WIN32
                 m_sharedMutex = CreateMutexA(NULL, FALSE, kSharedMutexName);
                 const bool locked = LockShared();
 
@@ -99,6 +111,35 @@ namespace Network {
                 }
 
                 if (locked) UnlockShared();
+#else
+                int fd = open("/tmp/.antigravity_proxy_fakeip.map", O_RDWR | O_CREAT, 0666);
+                if (fd < 0) return;
+                m_sharedFd = fd;
+                const bool locked = LockShared();
+
+                struct stat st;
+                if (fstat(fd, &st) == 0 && st.st_size < static_cast<off_t>(sizeof(SharedTable))) {
+                    if (ftruncate(fd, sizeof(SharedTable)) != 0) {
+                        if (locked) UnlockShared();
+                        return;
+                    }
+                }
+                void* addr = mmap(nullptr, sizeof(SharedTable), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+                if (addr == MAP_FAILED) {
+                    m_shared = nullptr;
+                    if (locked) UnlockShared();
+                    return;
+                }
+                m_shared = reinterpret_cast<SharedTable*>(addr);
+                const bool needInit = (m_shared->magic != kSharedMagic) || (m_shared->capacity != kSharedCapacity);
+                if (needInit) {
+                    std::memset(m_shared, 0, sizeof(SharedTable));
+                    m_shared->magic = kSharedMagic;
+                    m_shared->capacity = kSharedCapacity;
+                    m_shared->cursor = 0;
+                }
+                if (locked) UnlockShared();
+#endif
             });
         }
 
@@ -151,13 +192,10 @@ namespace Network {
 
                 if (ParseCidr(cidr, m_baseIp, m_mask)) {
                     m_networkSize = ~m_mask + 1; // e.g. /24 -> 256
-                    // FIX-4: 边界检查 - 网段过小会导致分配失败或频繁回绕
                     if (m_networkSize <= 2) {
                         Core::Logger::Warn("FakeIP: CIDR 网段过小 (容量=" + std::to_string(m_networkSize) + 
                                            ")，建议使用 /24 或更大网段");
                     }
-                    // 保留 .0 和最后一个地址（广播）? FakeIP 场景下通常都可以用，
-                    // 但为了规避某些系统行为，跳过第0个和最后一个是个好习惯。
                     Core::Logger::Info("FakeIP: 初始化成功, CIDR=" + cidr +
                                        ", 容量=" + std::to_string(m_networkSize));
                 } else {
@@ -176,7 +214,6 @@ namespace Network {
             std::string ipPart = cidr.substr(0, slashPos);
             std::string bitsPart = cidr.substr(slashPos + 1);
             
-            // WARN-3: 避免 std::stoi 抛异常导致初始化失败（使用 from_chars，失败返回 false）
             auto trim = [](std::string_view s) -> std::string_view {
                 while (!s.empty() && std::isspace((unsigned char)s.front())) s.remove_prefix(1);
                 while (!s.empty() && std::isspace((unsigned char)s.back())) s.remove_suffix(1);
@@ -194,11 +231,9 @@ namespace Network {
             if (inet_pton(AF_INET, ipPart.c_str(), &addr) != 1) return false;
 
             outBase = ntohl(addr.s_addr);
-            // 这里处理 bits=0 的边界情况
             if (bits == 0) outMask = 0;
             else outMask = 0xFFFFFFFF << (32 - bits);
             
-            // 确保 base 是网段首地址
             outBase &= outMask; 
             return true;
         }
@@ -208,17 +243,14 @@ namespace Network {
         
         static FakeIP& Instance() {
             static FakeIP instance;
-            // 延迟初始化，确保 Config 已加载（线程安全）
             instance.EnsureInitialized();
             return instance;
         }
         
         void Init() {
-            // 兼容旧调用：转为线程安全的一次性初始化
             EnsureInitialized();
         }
 
-        // FIX-3: 检查是否为虚拟 IP（加锁保护，避免与初始化/分配操作产生 data race）
         bool IsFakeIP(uint32_t ipNetworkOrder) {
             EnsureInitialized();
             std::lock_guard<std::mutex> lock(m_mtx);
@@ -235,7 +267,6 @@ namespace Network {
             // 1. 如果已存在映射，直接返回
             auto it = m_domainToIp.find(domain);
             if (it != m_domainToIp.end()) {
-                // 可选：更新 LRU？Ring Buffer 不需要 LRU，由于空间只要够大，复用率低
                 if (Core::Logger::IsEnabled(Core::LogLevel::Debug)) {
                     Core::Logger::Debug("FakeIP: 命中 " + domain + " -> " + IpToString(htonl(it->second)));
                 }
@@ -244,14 +275,12 @@ namespace Network {
             
             // 2. 分配新 IP
             if (m_networkSize <= 2) {
-                // 防御性检查：网段过小会导致无法分配（此处记录告警便于排障）
                 Core::Logger::Warn("FakeIP: 地址池过小，无法分配 (networkSize=" + std::to_string(m_networkSize) + ")");
                 return 0;
             }
 
             // 游标移动
             uint32_t offset = m_cursor++;
-            // 简单的 Ring Buffer: 超过范围回到 1
             if (m_cursor >= m_networkSize - 1) { 
                 m_cursor = 1; 
                 Core::Logger::Debug("FakeIP: 地址池循环回绕");
@@ -262,7 +291,6 @@ namespace Network {
             // 3. 检查并清理旧映射 (Collision handling)
             auto oldIt = m_ipToDomain.find(newIp);
             if (oldIt != m_ipToDomain.end()) {
-                // 把旧域名从反向表中移除
                 m_domainToIp.erase(oldIt->second);
                 if (Core::Logger::IsEnabled(Core::LogLevel::Debug)) {
                     Core::Logger::Debug("FakeIP: 回收 " + IpToString(htonl(newIp)) + " (原域名: " + oldIt->second + ")");
@@ -273,7 +301,7 @@ namespace Network {
             m_ipToDomain[newIp] = domain;
             m_domainToIp[domain] = newIp;
 
-            // 同步写入跨进程共享映射，降低多进程 miss 概率
+            // 同步写入跨进程共享映射
             SharedPut(newIp, domain);
             
             if (Core::Logger::IsEnabled(Core::LogLevel::Debug)) {
@@ -307,7 +335,6 @@ namespace Network {
                 return sharedDomain;
             }
 
-            // 如果是 FakeIP 网段内地址但查不到，通常意味着已回收/未分配或上下文不一致
             const bool isFake = ((ip & m_mask) == m_baseIp);
             if (isFake) {
                 Core::Logger::Warn("FakeIP: 查询未命中 " + IpToString(ipNetworkOrder) + "，可能已回收或未分配");
@@ -317,7 +344,6 @@ namespace Network {
             return "";
         }
         
-        // 辅助函数：IP 转字符串
         static std::string IpToString(uint32_t ipNetworkOrder) {
             char buf[INET_ADDRSTRLEN];
             in_addr addr;
