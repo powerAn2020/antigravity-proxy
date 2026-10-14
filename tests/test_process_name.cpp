@@ -44,5 +44,20 @@ int main() {
     assert(!IsAntigravityHostProcessName("language_server.exe"));
     assert(!IsAntigravityHostProcessName("node.exe"));
 
+#ifndef _WIN32
+    assert(Hooks::IsChromiumSandboxedProcessType("--type=renderer"));
+    assert(Hooks::IsChromiumSandboxedProcessType("--type=gpu-process"));
+    assert(Hooks::IsChromiumSandboxedProcessType("--type=zygote"));
+    assert(Hooks::IsChromiumSandboxedProcessType("--type=crashpad-handler"));
+    assert(!Hooks::IsChromiumSandboxedProcessType("--type=utility"));
+    assert(!Hooks::IsChromiumSandboxedProcessType("antigravity-ide"));
+
+    char* testArgvRenderer[] = { const_cast<char*>("antigravity-ide"), const_cast<char*>("--type=renderer"), nullptr };
+    assert(Hooks::IsChildArgvChromiumSandboxed(testArgvRenderer));
+
+    char* testArgvUtility[] = { const_cast<char*>("antigravity-ide"), const_cast<char*>("--type=utility"), nullptr };
+    assert(!Hooks::IsChildArgvChromiumSandboxed(testArgvUtility));
+#endif
+
     return 0;
 }

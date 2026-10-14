@@ -52,6 +52,8 @@ build_linux/
 
 *.zip
 *.7z
+*.tar.gz
+release-assets/
 
 build/
 build-x64/

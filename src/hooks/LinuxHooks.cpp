@@ -385,6 +385,212 @@ static bool DoProxyHandshake(int s, const std::string& targetHost, uint16_t targ
     return ok;
 }
 
+// ============= Linux UDP Associate & Proxy =============
+struct LinuxUdpProxyContext {
+    int udpSock = -1;
+    int controlSock = -1;
+    sockaddr_storage relayAddr{};
+    socklen_t relayAddrLen = 0;
+    bool relayConnected = false;
+    std::string defaultTargetHost;
+    uint16_t defaultTargetPort = 0;
+    bool hasDefaultTarget = false;
+    uint64_t createdTick = 0;
+};
+
+static std::unordered_map<int, LinuxUdpProxyContext> g_linuxUdpProxy;
+static std::mutex g_linuxUdpProxyMtx;
+
+static void CleanupUdpProxyContext(int s) {
+    int controlToClose = -1;
+    {
+        std::lock_guard<std::mutex> lock(g_linuxUdpProxyMtx);
+        auto it = g_linuxUdpProxy.find(s);
+        if (it != g_linuxUdpProxy.end()) {
+            controlToClose = it->second.controlSock;
+            g_linuxUdpProxy.erase(it);
+        }
+    }
+    if (controlToClose >= 0 && real_close) {
+        real_close(controlToClose);
+    }
+}
+
+static bool TryGetUdpProxyContext(int s, LinuxUdpProxyContext* out) {
+    if (s < 0) return false;
+    std::lock_guard<std::mutex> lock(g_linuxUdpProxyMtx);
+    auto it = g_linuxUdpProxy.find(s);
+    if (it != g_linuxUdpProxy.end()) {
+        if (out) *out = it->second;
+        return true;
+    }
+    return false;
+}
+
+static void PurgeStaleLinuxUdpProxyContexts(uint64_t now) {
+    constexpr uint64_t kUdpContextTtlMs = 300000; // 5 分钟
+    std::vector<int> controlSocketsToClose;
+    {
+        std::lock_guard<std::mutex> lock(g_linuxUdpProxyMtx);
+        for (auto it = g_linuxUdpProxy.begin(); it != g_linuxUdpProxy.end(); ) {
+            if (now > it->second.createdTick && (now - it->second.createdTick) > kUdpContextTtlMs) {
+                controlSocketsToClose.push_back(it->second.controlSock);
+                it = g_linuxUdpProxy.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (int sock : controlSocketsToClose) {
+        if (sock >= 0 && real_close) real_close(sock);
+    }
+}
+
+static int ConnectTcpToProxyServer(const Core::ProxyConfig& proxy) {
+    if (!real_connect) InitRealFunctions();
+    int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s >= 0) {
+        sockaddr_in a4{};
+        if (BuildProxyAddr(proxy, &a4)) {
+            if (real_connect(s, reinterpret_cast<sockaddr*>(&a4), sizeof(a4)) == 0) {
+                return s;
+            }
+        }
+        if (real_close) real_close(s);
+        else close(s);
+    }
+
+    // 尝试 IPv6
+    int s6 = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+    if (s6 >= 0) {
+        sockaddr_in6 a6{};
+        if (BuildProxyAddrV6(proxy, &a6)) {
+            Network::EnsureIpv6DualStack(s6, AF_INET6);
+            if (real_connect(s6, reinterpret_cast<sockaddr*>(&a6), sizeof(a6)) == 0) {
+                return s6;
+            }
+        }
+        if (real_close) real_close(s6);
+        else close(s6);
+    }
+    return -1;
+}
+
+static bool EnsureUdpProxyReady(int s, const std::string& defaultHost, uint16_t defaultPort, bool connectRelay = true) {
+    auto& config = Core::Config::Instance();
+    if (s < 0 || config.proxy.port == 0) {
+        errno = EINVAL;
+        return false;
+    }
+    if (config.proxy.type != "socks5") {
+        Core::Logger::Warn("UDP 代理仅支持 SOCKS5 (UDP Associate)。当前 proxy.type=" + config.proxy.type + "，将回退/阻断");
+        errno = EACCES;
+        return false;
+    }
+
+    PurgeStaleLinuxUdpProxyContexts(GetTickCount64());
+
+    // 检查是否已有上下文
+    {
+        std::lock_guard<std::mutex> lock(g_linuxUdpProxyMtx);
+        auto it = g_linuxUdpProxy.find(s);
+        if (it != g_linuxUdpProxy.end()) {
+            if (!defaultHost.empty() && defaultPort != 0) {
+                it->second.defaultTargetHost = defaultHost;
+                it->second.defaultTargetPort = defaultPort;
+                it->second.hasDefaultTarget = true;
+            }
+            if (!connectRelay || it->second.relayConnected) {
+                return true;
+            }
+            if (real_connect(s, reinterpret_cast<const sockaddr*>(&it->second.relayAddr), it->second.relayAddrLen) == 0) {
+                it->second.relayConnected = true;
+                return true;
+            }
+            return false;
+        }
+    }
+
+    int tcpSock = ConnectTcpToProxyServer(config.proxy);
+    if (tcpSock < 0) {
+        Core::Logger::Error("UDP 代理: 无法连接 SOCKS5 代理 " + config.proxy.host + ":" + std::to_string(config.proxy.port));
+        errno = ECONNREFUSED;
+        return false;
+    }
+
+    Network::SocketWrapper sockWrap(tcpSock);
+    sockWrap.SetTimeouts(config.timeout.recv_ms, config.timeout.send_ms);
+
+    Network::Socks5Udp::UdpAssociateResult assoc{};
+    if (!Network::Socks5Udp::UdpAssociate(tcpSock, nullptr, 0, &assoc)) {
+        Core::Logger::Error("UDP 代理: SOCKS5 UDP Associate 协商失败");
+        if (real_close) real_close(tcpSock);
+        else close(tcpSock);
+        errno = ECONNREFUSED;
+        return false;
+    }
+
+    // 适配 IPv6 dual-stack
+    sockaddr_storage localAddr{};
+    socklen_t localLen = sizeof(localAddr);
+    if (getsockname(s, reinterpret_cast<sockaddr*>(&localAddr), &localLen) == 0) {
+        if (localAddr.ss_family == AF_INET6 && assoc.relayAddr.ss_family == AF_INET) {
+            sockaddr_in6 relay6{};
+            relay6.sin6_family = AF_INET6;
+            relay6.sin6_port = reinterpret_cast<sockaddr_in*>(&assoc.relayAddr)->sin_port;
+            relay6.sin6_addr.s6_addr[10] = 0xff;
+            relay6.sin6_addr.s6_addr[11] = 0xff;
+            std::memcpy(&relay6.sin6_addr.s6_addr[12], &reinterpret_cast<sockaddr_in*>(&assoc.relayAddr)->sin_addr, 4);
+            std::memcpy(&assoc.relayAddr, &relay6, sizeof(relay6));
+            assoc.relayAddrLen = sizeof(relay6);
+            Network::EnsureIpv6DualStack(s, AF_INET6);
+        }
+    }
+
+    if (connectRelay) {
+        if (real_connect(s, reinterpret_cast<const sockaddr*>(&assoc.relayAddr), assoc.relayAddrLen) != 0) {
+            Core::Logger::Error("UDP 代理: connect relay 失败, errno=" + std::to_string(errno));
+            if (real_close) real_close(tcpSock);
+            else close(tcpSock);
+            return false;
+        }
+    }
+
+    LinuxUdpProxyContext ctx{};
+    ctx.udpSock = s;
+    ctx.controlSock = tcpSock;
+    ctx.relayAddr = assoc.relayAddr;
+    ctx.relayAddrLen = static_cast<socklen_t>(assoc.relayAddrLen);
+    ctx.relayConnected = connectRelay;
+    if (!defaultHost.empty() && defaultPort != 0) {
+        ctx.defaultTargetHost = defaultHost;
+        ctx.defaultTargetPort = defaultPort;
+        ctx.hasDefaultTarget = true;
+    }
+    ctx.createdTick = GetTickCount64();
+
+    int orphanControl = -1;
+    {
+        std::lock_guard<std::mutex> lock(g_linuxUdpProxyMtx);
+        auto it = g_linuxUdpProxy.find(s);
+        if (it == g_linuxUdpProxy.end()) {
+            g_linuxUdpProxy[s] = ctx;
+        } else {
+            orphanControl = tcpSock;
+            if (!defaultHost.empty() && defaultPort != 0) {
+                it->second.defaultTargetHost = defaultHost;
+                it->second.defaultTargetPort = defaultPort;
+                it->second.hasDefaultTarget = true;
+            }
+        }
+    }
+    if (orphanControl >= 0) {
+        if (real_close) real_close(orphanControl);
+        else close(orphanControl);
+    }
+    return true;
+}
+
 // 执行核心代理连接决策
 static int PerformProxyConnect(int s, const struct sockaddr* name, socklen_t namelen) {
     if (!real_connect) InitRealFunctions();
@@ -402,24 +608,70 @@ static int PerformProxyConnect(int s, const struct sockaddr* name, socklen_t nam
     }
     SetLocalBypassSocket(s, false);
 
-    // 仅代理 SOCK_STREAM (TCP)
+    // 非 IPv4 / IPv6 协议族（如 AF_UNIX 本地 IPC）直接放行，避免触发 getsockopt
+    if (name->sa_family != AF_INET && name->sa_family != AF_INET6) {
+        return real_connect(s, name, namelen);
+    }
+
+    // 检查套接字类型 (TCP vs UDP)
     int soType = 0;
     socklen_t optLen = sizeof(soType);
     if (getsockopt(s, SOL_SOCKET, SO_TYPE, &soType, &optLen) == 0) {
-        if (soType != SOCK_STREAM) {
-            if (soType == SOCK_DGRAM) {
-                const Core::UdpAction udpAction = Core::ResolveUdpAction(
-                    config.rules.udp_mode, config.proxy.type, config.rules.udp_fallback);
-                if (udpAction == Core::UdpAction::Block) {
-                    uint16_t dstPort = 0;
-                    TryGetSockaddrPort(name, &dstPort);
-                    if (dstPort != 53 && !Network::IsLoopbackSockaddr(name, namelen)) {
-                        Core::Logger::Warn("已阻止 UDP 连接(策略: block), fd=" + std::to_string(s));
-                        errno = EACCES;
-                        return -1;
-                    }
-                }
+        if (soType == SOCK_DGRAM) {
+            uint16_t dstPort = 0;
+            TryGetSockaddrPort(name, &dstPort);
+            if (dstPort == 53 && (config.rules.dns_mode == "direct" || config.rules.dns_mode.empty())) {
+                return real_connect(s, name, namelen);
             }
+
+            const Core::UdpAction udpAction = Core::ResolveUdpAction(
+                config.rules.udp_mode, config.proxy.type, config.rules.udp_fallback);
+
+            if (udpAction == Core::UdpAction::Block) {
+                Core::Logger::Warn("已阻止 UDP 连接(策略: block), fd=" + std::to_string(s));
+                errno = EACCES;
+                return -1;
+            }
+            if (udpAction == Core::UdpAction::Direct) {
+                return real_connect(s, name, namelen);
+            }
+            if (udpAction == Core::UdpAction::Proxy) {
+                std::string originalHost;
+                uint16_t originalPort = 0;
+                if (!ResolveOriginalTarget(name, &originalHost, &originalPort)) {
+                    return real_connect(s, name, namelen);
+                }
+                if (Network::IsLoopbackHost(originalHost) || IsProxySelfTarget(originalHost, originalPort, config.proxy)) {
+                    return real_connect(s, name, namelen);
+                }
+
+                std::string addrIp;
+                bool addrIsV6 = false;
+                SockaddrToIp(name, &addrIp, &addrIsV6);
+                std::string routeAction;
+                std::string routeRule;
+                config.rules.MatchRouting(originalHost, addrIp, addrIsV6, originalPort, "udp", &routeAction, &routeRule);
+                if (routeAction == "direct") {
+                    return real_connect(s, name, namelen);
+                }
+                if (!config.rules.IsPortAllowed(originalPort)) {
+                    return real_connect(s, name, namelen);
+                }
+
+                if (!EnsureUdpProxyReady(s, originalHost, originalPort, true)) {
+                    if (config.rules.udp_fallback == "direct") {
+                        CleanupUdpProxyContext(s);
+                        return real_connect(s, name, namelen);
+                    }
+                    errno = ECONNREFUSED;
+                    return -1;
+                }
+                SaveSocketTarget(s, originalHost, originalPort);
+                Core::Logger::Info("UDP 代理连接成功建立: " + originalHost + ":" + std::to_string(originalPort) + " (fd=" + std::to_string(s) + ")");
+                return 0;
+            }
+            return real_connect(s, name, namelen);
+        } else if (soType != SOCK_STREAM) {
             return real_connect(s, name, namelen);
         }
     }
@@ -531,10 +783,12 @@ static std::string GetCurrentLibraryPath() {
 }
 
 // 检查并准备子进程的环境变量（确保 LD_PRELOAD 传递或排除）
-static std::vector<char*> PrepareChildEnvironment(const char* file, char* const envp[]) {
+static std::vector<char*> PrepareChildEnvironment(const char* file, char* const argv[], char* const envp[]) {
     auto& config = Core::Config::Instance();
     std::string baseName = Hooks::ExtractBaseNameFromPathLike(file ? file : "");
-    bool inject = config.childInjection && config.ShouldInjectChildProcess(baseName);
+    // 如果子进程为 Chromium 沙箱受限进程（如 renderer/gpu/zygote 等），严禁传递 LD_PRELOAD
+    bool isSandboxed = Hooks::IsChildArgvChromiumSandboxed(argv);
+    bool inject = !isSandboxed && config.childInjection && config.ShouldInjectChildProcess(baseName);
 
     std::string libPath = GetCurrentLibraryPath();
     std::vector<std::string> newEnvStrings;
@@ -566,6 +820,54 @@ static std::vector<char*> PrepareChildEnvironment(const char* file, char* const 
         newEnvStrings.push_back("LD_PRELOAD=" + libPath);
     }
 
+    // 确保子进程继承配置文件路径
+    if (const char* cfgEnv = getenv("ANTIGRAVITY_PROXY_CONFIG")) {
+        if (*cfgEnv) {
+            bool foundCfg = false;
+            for (const auto& s : newEnvStrings) {
+                if (s.rfind("ANTIGRAVITY_PROXY_CONFIG=", 0) == 0) {
+                    foundCfg = true;
+                    break;
+                }
+            }
+            if (!foundCfg) {
+                newEnvStrings.push_back("ANTIGRAVITY_PROXY_CONFIG=" + std::string(cfgEnv));
+            }
+        }
+    }
+
+    // 确保为 Go 目标子进程（如 language_server、agy）传递标准代理环境变量
+    bool isGoTarget = (baseName.find("language_server") != std::string::npos ||
+                       baseName.find("agy") != std::string::npos);
+    if (isGoTarget && config.proxy.port != 0) {
+        std::string scheme = config.proxy.type.empty() ? "socks5" : config.proxy.type;
+        std::string proxyUrl = scheme + "://" + config.proxy.host + ":" + std::to_string(config.proxy.port);
+        const std::vector<std::pair<std::string, std::string>> proxyVars = {
+            {"ALL_PROXY", proxyUrl},
+            {"all_proxy", proxyUrl},
+            {"HTTP_PROXY", proxyUrl},
+            {"http_proxy", proxyUrl},
+            {"HTTPS_PROXY", proxyUrl},
+            {"https_proxy", proxyUrl},
+            {"NO_PROXY", "localhost,127.0.0.1,::1"},
+            {"no_proxy", "localhost,127.0.0.1,::1"}
+        };
+        for (const auto& kv : proxyVars) {
+            std::string prefix = kv.first + "=";
+            bool found = false;
+            for (auto& s : newEnvStrings) {
+                if (s.rfind(prefix, 0) == 0) {
+                    s = prefix + kv.second;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                newEnvStrings.push_back(prefix + kv.second);
+            }
+        }
+    }
+
     std::vector<char*> result;
     result.reserve(newEnvStrings.size() + 1);
     for (const auto& s : newEnvStrings) {
@@ -594,6 +896,9 @@ AGY_EXPORT int connect(int sockfd, const struct sockaddr* addr, socklen_t addrle
     if (!guard.acquired()) {
         return real_connect ? real_connect(sockfd, addr, addrlen) : -1;
     }
+    if (Hooks::IsCurrentProcessChromiumSandboxed()) {
+        return real_connect ? real_connect(sockfd, addr, addrlen) : -1;
+    }
     return PerformProxyConnect(sockfd, addr, addrlen);
 }
 
@@ -601,6 +906,9 @@ AGY_EXPORT int getaddrinfo(const char* node, const char* service, const struct a
     if (!real_getaddrinfo) InitRealFunctions();
     RecursionGuard guard;
     if (!guard.acquired()) {
+        return real_getaddrinfo ? real_getaddrinfo(node, service, hints, res) : EAI_FAIL;
+    }
+    if (Hooks::IsCurrentProcessChromiumSandboxed()) {
         return real_getaddrinfo ? real_getaddrinfo(node, service, hints, res) : EAI_FAIL;
     }
 
@@ -649,6 +957,9 @@ AGY_EXPORT struct hostent* gethostbyname(const char* name) {
     if (!guard.acquired()) {
         return real_gethostbyname ? real_gethostbyname(name) : nullptr;
     }
+    if (Hooks::IsCurrentProcessChromiumSandboxed()) {
+        return real_gethostbyname ? real_gethostbyname(name) : nullptr;
+    }
 
     auto& config = Core::Config::Instance();
     if (name && config.fakeIp.enabled) {
@@ -678,7 +989,33 @@ AGY_EXPORT struct hostent* gethostbyname(const char* name) {
 
 AGY_EXPORT ssize_t send(int sockfd, const void* buf, size_t len, int flags) {
     if (!real_send) InitRealFunctions();
-    if (Core::Config::Instance().trafficLogging) {
+    RecursionGuard guard;
+    if (!guard.acquired()) {
+        return real_send ? real_send(sockfd, buf, len, flags) : -1;
+    }
+    if (Hooks::IsCurrentProcessChromiumSandboxed()) {
+        return real_send ? real_send(sockfd, buf, len, flags) : -1;
+    }
+
+    auto& config = Core::Config::Instance();
+    if (config.proxy.port != 0) {
+        LinuxUdpProxyContext ctx;
+        if (TryGetUdpProxyContext(sockfd, &ctx) && ctx.hasDefaultTarget) {
+            std::vector<uint8_t> packet;
+            if (!Network::Socks5Udp::Wrap(ctx.defaultTargetHost, ctx.defaultTargetPort, static_cast<const uint8_t*>(buf), len, &packet)) {
+                errno = ECONNREFUSED;
+                return -1;
+            }
+            ssize_t sent = real_send(sockfd, packet.data(), packet.size(), flags);
+            if (sent < 0) return -1;
+            if (config.trafficLogging) {
+                Network::TrafficMonitor::Instance().LogSend(sockfd, static_cast<const char*>(buf), static_cast<int>(len));
+            }
+            return len; // 用户视角返回原始 payload 长度
+        }
+    }
+
+    if (config.trafficLogging) {
         Network::TrafficMonitor::Instance().LogSend(sockfd, static_cast<const char*>(buf), static_cast<int>(len));
     }
     return real_send ? real_send(sockfd, buf, len, flags) : -1;
@@ -686,8 +1023,42 @@ AGY_EXPORT ssize_t send(int sockfd, const void* buf, size_t len, int flags) {
 
 AGY_EXPORT ssize_t recv(int sockfd, void* buf, size_t len, int flags) {
     if (!real_recv) InitRealFunctions();
+    RecursionGuard guard;
+    if (!guard.acquired()) {
+        return real_recv ? real_recv(sockfd, buf, len, flags) : -1;
+    }
+    if (Hooks::IsCurrentProcessChromiumSandboxed()) {
+        return real_recv ? real_recv(sockfd, buf, len, flags) : -1;
+    }
+
+    auto& config = Core::Config::Instance();
+    if (config.proxy.port != 0) {
+        LinuxUdpProxyContext ctx;
+        if (TryGetUdpProxyContext(sockfd, &ctx)) {
+            const size_t cap = len + Network::Socks5Udp::kMaxUdpHeaderBytes;
+            std::vector<uint8_t> tmp(cap);
+            ssize_t rc = real_recv(sockfd, tmp.data(), tmp.size(), flags);
+            if (rc <= 0) return rc;
+
+            Network::Socks5Udp::UnwrapResult unwrap{};
+            if (!Network::Socks5Udp::Unwrap(tmp.data(), static_cast<size_t>(rc), &unwrap)) {
+                errno = ECONNRESET;
+                return -1;
+            }
+
+            size_t userBytes = (unwrap.payloadLen > len) ? len : unwrap.payloadLen;
+            if (userBytes > 0 && unwrap.payload) {
+                std::memcpy(buf, unwrap.payload, userBytes);
+            }
+            if (config.trafficLogging) {
+                Network::TrafficMonitor::Instance().LogRecv(sockfd, static_cast<const char*>(buf), static_cast<int>(userBytes));
+            }
+            return static_cast<ssize_t>(userBytes);
+        }
+    }
+
     ssize_t ret = real_recv ? real_recv(sockfd, buf, len, flags) : -1;
-    if (ret > 0 && Core::Config::Instance().trafficLogging) {
+    if (ret > 0 && config.trafficLogging) {
         Network::TrafficMonitor::Instance().LogRecv(sockfd, static_cast<const char*>(buf), static_cast<int>(ret));
     }
     return ret;
@@ -695,11 +1066,163 @@ AGY_EXPORT ssize_t recv(int sockfd, void* buf, size_t len, int flags) {
 
 AGY_EXPORT ssize_t sendto(int sockfd, const void* buf, size_t len, int flags, const struct sockaddr* dest_addr, socklen_t addrlen) {
     if (!real_sendto) InitRealFunctions();
+    RecursionGuard guard;
+    if (!guard.acquired()) {
+        return real_sendto ? real_sendto(sockfd, buf, len, flags, dest_addr, addrlen) : -1;
+    }
+    if (Hooks::IsCurrentProcessChromiumSandboxed()) {
+        return real_sendto ? real_sendto(sockfd, buf, len, flags, dest_addr, addrlen) : -1;
+    }
+
+    // 1. dest_addr 为空（已连接 UDP），查表处理，无任何系统调用
+    if (!dest_addr) {
+        auto& config = Core::Config::Instance();
+        LinuxUdpProxyContext ctx;
+        if (config.proxy.port != 0 && TryGetUdpProxyContext(sockfd, &ctx) && ctx.hasDefaultTarget) {
+            std::vector<uint8_t> packet;
+            if (!Network::Socks5Udp::Wrap(ctx.defaultTargetHost, ctx.defaultTargetPort, static_cast<const uint8_t*>(buf), len, &packet)) {
+                errno = ECONNREFUSED;
+                return -1;
+            }
+            ssize_t sent = real_send ? real_send(sockfd, packet.data(), packet.size(), flags)
+                                     : real_sendto(sockfd, packet.data(), packet.size(), flags, nullptr, 0);
+            if (sent < 0) return -1;
+            if (config.trafficLogging) {
+                Network::TrafficMonitor::Instance().LogSend(sockfd, static_cast<const char*>(buf), static_cast<int>(len));
+            }
+            return len;
+        }
+        return real_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
+    }
+
+    // 2. 非 IPv4 / IPv6 目标地址（如 AF_UNIX 本地 IPC）直接放行，绝不调用 getsockopt
+    if (dest_addr->sa_family != AF_INET && dest_addr->sa_family != AF_INET6) {
+        return real_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
+    }
+
+    // 3. 回环连接直接放行
+    if (Network::IsLoopbackSockaddr(dest_addr, addrlen)) {
+        return real_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
+    }
+
+    auto& config = Core::Config::Instance();
+    int soType = 0;
+    socklen_t optLen = sizeof(soType);
+    if (config.proxy.port != 0 && getsockopt(sockfd, SOL_SOCKET, SO_TYPE, &soType, &optLen) == 0 && soType == SOCK_DGRAM) {
+        const Core::UdpAction udpAction = Core::ResolveUdpAction(
+            config.rules.udp_mode, config.proxy.type, config.rules.udp_fallback);
+
+        uint16_t dstPort = 0;
+        TryGetSockaddrPort(dest_addr, &dstPort);
+        if (dstPort == 53 && (config.rules.dns_mode == "direct" || config.rules.dns_mode.empty())) {
+            return real_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
+        }
+
+        if (udpAction == Core::UdpAction::Block) {
+            errno = EACCES;
+            return -1;
+        }
+
+        if (udpAction == Core::UdpAction::Direct) {
+            return real_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
+        }
+
+        if (udpAction == Core::UdpAction::Proxy) {
+            std::string host;
+            uint16_t port = 0;
+            if (!ResolveOriginalTarget(dest_addr, &host, &port)) {
+                return real_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
+            }
+            if (Network::IsLoopbackHost(host) || IsProxySelfTarget(host, port, config.proxy)) {
+                return real_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
+            }
+
+            std::string addrIp;
+            bool addrIsV6 = false;
+            SockaddrToIp(dest_addr, &addrIp, &addrIsV6);
+            std::string routeAction;
+            std::string routeRule;
+            config.rules.MatchRouting(host, addrIp, addrIsV6, port, "udp", &routeAction, &routeRule);
+            if (routeAction == "direct") {
+                return real_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
+            }
+
+            if (!EnsureUdpProxyReady(sockfd, host, port, true)) {
+                if (config.rules.udp_fallback == "direct") {
+                    CleanupUdpProxyContext(sockfd);
+                    return real_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
+                }
+                errno = ECONNREFUSED;
+                return -1;
+            }
+
+            std::vector<uint8_t> packet;
+            if (!Network::Socks5Udp::Wrap(host, port, static_cast<const uint8_t*>(buf), len, &packet)) {
+                if (config.rules.udp_fallback == "direct") {
+                    CleanupUdpProxyContext(sockfd);
+                    return real_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
+                }
+                errno = ECONNREFUSED;
+                return -1;
+            }
+
+            ssize_t sent = real_send ? real_send(sockfd, packet.data(), packet.size(), flags)
+                                     : real_sendto(sockfd, packet.data(), packet.size(), flags, nullptr, 0);
+            if (sent < 0) return -1;
+            if (config.trafficLogging) {
+                Network::TrafficMonitor::Instance().LogSend(sockfd, static_cast<const char*>(buf), static_cast<int>(len));
+            }
+            return len;
+        }
+    }
+
     return real_sendto ? real_sendto(sockfd, buf, len, flags, dest_addr, addrlen) : -1;
 }
 
 AGY_EXPORT ssize_t recvfrom(int sockfd, void* buf, size_t len, int flags, struct sockaddr* src_addr, socklen_t* addrlen) {
     if (!real_recvfrom) InitRealFunctions();
+    RecursionGuard guard;
+    if (!guard.acquired()) {
+        return real_recvfrom ? real_recvfrom(sockfd, buf, len, flags, src_addr, addrlen) : -1;
+    }
+    if (Hooks::IsCurrentProcessChromiumSandboxed()) {
+        return real_recvfrom ? real_recvfrom(sockfd, buf, len, flags, src_addr, addrlen) : -1;
+    }
+
+    auto& config = Core::Config::Instance();
+    if (config.proxy.port != 0) {
+        LinuxUdpProxyContext ctx;
+        if (TryGetUdpProxyContext(sockfd, &ctx)) {
+            const size_t cap = len + Network::Socks5Udp::kMaxUdpHeaderBytes;
+            std::vector<uint8_t> tmp(cap);
+            sockaddr_storage fromTmp{};
+            socklen_t fromTmpLen = sizeof(fromTmp);
+            ssize_t rc = real_recvfrom(sockfd, tmp.data(), tmp.size(), flags, reinterpret_cast<struct sockaddr*>(&fromTmp), &fromTmpLen);
+            if (rc <= 0) return rc;
+
+            Network::Socks5Udp::UnwrapResult unwrap{};
+            if (!Network::Socks5Udp::Unwrap(tmp.data(), static_cast<size_t>(rc), &unwrap)) {
+                errno = ECONNRESET;
+                return -1;
+            }
+
+            if (src_addr && addrlen && *addrlen > 0 && unwrap.srcLen > 0) {
+                socklen_t copyLen = (*addrlen < static_cast<socklen_t>(unwrap.srcLen)) ? *addrlen : static_cast<socklen_t>(unwrap.srcLen);
+                std::memcpy(src_addr, &unwrap.src, copyLen);
+                *addrlen = static_cast<socklen_t>(unwrap.srcLen);
+            }
+
+            size_t userBytes = (unwrap.payloadLen > len) ? len : unwrap.payloadLen;
+            if (userBytes > 0 && unwrap.payload) {
+                std::memcpy(buf, unwrap.payload, userBytes);
+            }
+            if (config.trafficLogging) {
+                Network::TrafficMonitor::Instance().LogRecv(sockfd, static_cast<const char*>(buf), static_cast<int>(userBytes));
+            }
+            return static_cast<ssize_t>(userBytes);
+        }
+    }
+
     return real_recvfrom ? real_recvfrom(sockfd, buf, len, flags, src_addr, addrlen) : -1;
 }
 
@@ -707,17 +1230,24 @@ AGY_EXPORT int close(int fd) {
     if (!real_close) InitRealFunctions();
     ForgetSocketTarget(fd);
     SetLocalBypassSocket(fd, false);
+    CleanupUdpProxyContext(fd);
     return real_close ? real_close(fd) : -1;
 }
 
 AGY_EXPORT int shutdown(int sockfd, int how) {
     if (!real_shutdown) InitRealFunctions();
+    if (Hooks::IsCurrentProcessChromiumSandboxed()) {
+        return real_shutdown ? real_shutdown(sockfd, how) : -1;
+    }
+    if (how == SHUT_RDWR) {
+        CleanupUdpProxyContext(sockfd);
+    }
     return real_shutdown ? real_shutdown(sockfd, how) : -1;
 }
 
 AGY_EXPORT int execve(const char* filename, char* const argv[], char* const envp[]) {
     if (!real_execve) InitRealFunctions();
-    std::vector<char*> newEnv = PrepareChildEnvironment(filename, envp);
+    std::vector<char*> newEnv = PrepareChildEnvironment(filename, argv, envp);
     int rc = real_execve(filename, argv, newEnv.data());
     FreeChildEnvironment(newEnv);
     return rc;
@@ -725,7 +1255,7 @@ AGY_EXPORT int execve(const char* filename, char* const argv[], char* const envp
 
 AGY_EXPORT int execv(const char* path, char* const argv[]) {
     if (!real_execv) InitRealFunctions();
-    std::vector<char*> newEnv = PrepareChildEnvironment(path, environ);
+    std::vector<char*> newEnv = PrepareChildEnvironment(path, argv, environ);
     int rc = real_execve(path, argv, newEnv.data());
     FreeChildEnvironment(newEnv);
     return rc;
@@ -733,7 +1263,7 @@ AGY_EXPORT int execv(const char* path, char* const argv[]) {
 
 AGY_EXPORT int execvp(const char* file, char* const argv[]) {
     if (!real_execvp) InitRealFunctions();
-    std::vector<char*> newEnv = PrepareChildEnvironment(file, environ);
+    std::vector<char*> newEnv = PrepareChildEnvironment(file, argv, environ);
     if (!real_execvpe) real_execvpe = (execvpe_t)dlsym(RTLD_NEXT, "execvpe");
     if (real_execvpe) {
         int rc = real_execvpe(file, argv, newEnv.data());
@@ -746,7 +1276,7 @@ AGY_EXPORT int execvp(const char* file, char* const argv[]) {
 
 AGY_EXPORT int execvpe(const char* file, char* const argv[], char* const envp[]) {
     if (!real_execvpe) InitRealFunctions();
-    std::vector<char*> newEnv = PrepareChildEnvironment(file, envp);
+    std::vector<char*> newEnv = PrepareChildEnvironment(file, argv, envp);
     if (real_execvpe) {
         int rc = real_execvpe(file, argv, newEnv.data());
         FreeChildEnvironment(newEnv);

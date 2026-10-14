@@ -441,16 +441,247 @@ namespace UpdateChecker {
 }
 #else // Linux / POSIX
 #include "UpdateChecker.hpp"
+
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <chrono>
+#include <cstdlib>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include <nlohmann/json.hpp>
+
 #include "../core/Config.hpp"
 #include "../core/Logger.hpp"
+
+namespace {
+    constexpr const char* kLatestReleaseApiUrl = "https://api.github.com/repos/yuaotian/antigravity-proxy/releases/latest";
+    constexpr const char* kDefaultReleasePage = "https://github.com/yuaotian/antigravity-proxy/releases/latest";
+
+    std::atomic<bool> g_linuxStarted{false};
+
+    struct LatestReleaseInfo {
+        std::string tagName;
+        std::string name;
+        std::string htmlUrl;
+        std::string body;
+    };
+
+    static std::string TrimAscii(std::string s) {
+        auto isWs = [](unsigned char c) { return std::isspace(c) != 0; };
+        size_t begin = 0;
+        while (begin < s.size() && isWs((unsigned char)s[begin])) begin++;
+        size_t end = s.size();
+        while (end > begin && isWs((unsigned char)s[end - 1])) end--;
+        return s.substr(begin, end - begin);
+    }
+
+    static std::string NormalizeVersionText(std::string version) {
+        version = TrimAscii(version);
+        if (!version.empty() && (version[0] == 'v' || version[0] == 'V')) {
+            version.erase(version.begin());
+        }
+        return version;
+    }
+
+    static std::vector<int> ParseVersionParts(std::string version) {
+        version = NormalizeVersionText(version);
+        std::vector<int> parts;
+        size_t i = 0;
+        while (i < version.size()) {
+            while (i < version.size() && !std::isdigit((unsigned char)version[i])) i++;
+            if (i >= version.size()) break;
+            int value = 0;
+            bool any = false;
+            while (i < version.size() && std::isdigit((unsigned char)version[i])) {
+                any = true;
+                value = value * 10 + (version[i] - '0');
+                i++;
+            }
+            if (any) parts.push_back(value);
+            if (parts.size() >= 4) break;
+        }
+        return parts;
+    }
+
+    static int CompareVersions(const std::string& current, const std::string& latest) {
+        const auto a = ParseVersionParts(current);
+        const auto b = ParseVersionParts(latest);
+        if (a.empty() || b.empty()) return 0;
+        const size_t n = (std::max)(a.size(), b.size());
+        for (size_t i = 0; i < n; ++i) {
+            const int av = i < a.size() ? a[i] : 0;
+            const int bv = i < b.size() ? b[i] : 0;
+            if (av < bv) return -1;
+            if (av > bv) return 1;
+        }
+        return 0;
+    }
+
+    static std::string JoinMirrorUrl(std::string mirror, const std::string& targetUrl) {
+        mirror = TrimAscii(mirror);
+        if (mirror.empty()) return "";
+        if (mirror.back() != '/') mirror.push_back('/');
+        return mirror + targetUrl;
+    }
+
+    static std::string GetUpdateNotifyMarkerPath() {
+        const std::string logDir = Core::Logger::GetLogDirectoryPath();
+        if (logDir.empty()) return "update-notify.marker";
+        return logDir + "/update-notify.marker";
+    }
+
+    static bool HasNotifiedRelease(const std::string& tagName) {
+        const auto& config = Core::Config::Instance();
+        if (!config.updates.notify_once) return false;
+        const std::string markerPath = GetUpdateNotifyMarkerPath();
+        std::ifstream f(markerPath);
+        if (!f.is_open()) return false;
+        std::string saved;
+        std::getline(f, saved);
+        return TrimAscii(saved) == TrimAscii(tagName);
+    }
+
+    static void MarkReleaseNotified(const std::string& tagName) {
+        const auto& config = Core::Config::Instance();
+        if (!config.updates.notify_once) return;
+        const std::string markerPath = GetUpdateNotifyMarkerPath();
+        std::ofstream f(markerPath, std::ios::out | std::ios::trunc);
+        if (f.is_open()) {
+            f << TrimAscii(tagName) << "\n";
+        }
+    }
+
+    static bool FetchUrlViaCurl(const std::string& url, int timeoutSec, std::string* out) {
+        if (!out || url.empty()) return false;
+        out->clear();
+
+        // 构造安全 curl 命令，不依赖 libcurl/OpenSSL 库链接
+        std::string cmd = "curl -s -f -m " + std::to_string(timeoutSec > 0 ? timeoutSec : 5) +
+                          " -H 'Accept: application/vnd.github+json' " +
+                          " -H 'User-Agent: antigravity-proxy-update-check' " +
+                          "\"" + url + "\" 2>/dev/null";
+
+        FILE* pipe = popen(cmd.c_str(), "r");
+        if (!pipe) return false;
+
+        char buffer[1024];
+        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+            *out += buffer;
+            if (out->size() > 1024 * 1024) break; // 保护上限 1MB
+        }
+        int status = pclose(pipe);
+        return (status == 0 && !out->empty());
+    }
+
+    static bool ParseLatestRelease(const std::string& jsonText, LatestReleaseInfo* out) {
+        if (!out || jsonText.empty()) return false;
+        nlohmann::json json;
+        try {
+            json = nlohmann::json::parse(jsonText);
+        } catch (...) {
+            return false;
+        }
+        out->tagName = json.value("tag_name", "");
+        out->name = json.value("name", "");
+        out->htmlUrl = json.value("html_url", "");
+        out->body = json.value("body", "");
+        if (out->tagName.empty()) {
+            Core::Logger::Warn("[更新] GitHub Release JSON 缺少 tag_name");
+            return false;
+        }
+        if (out->htmlUrl.empty()) {
+            out->htmlUrl = kDefaultReleasePage;
+        }
+        return true;
+    }
+
+    static bool QueryLatestReleaseJsonLinux(std::string* outBody) {
+        const auto& config = Core::Config::Instance();
+        const int timeoutSec = (config.updates.timeout_ms > 0 ? config.updates.timeout_ms : 5000) / 1000;
+
+        // 1. 直连官方 GitHub API
+        if (FetchUrlViaCurl(kLatestReleaseApiUrl, timeoutSec, outBody)) {
+            return true;
+        }
+
+        // 2. 尝试镜像站点
+        for (const auto& mirror : config.updates.mirrors) {
+            const std::string mirrorUrl = JoinMirrorUrl(mirror, kLatestReleaseApiUrl);
+            if (mirrorUrl.empty()) continue;
+            if (FetchUrlViaCurl(mirrorUrl, timeoutSec, outBody)) {
+                Core::Logger::Info("[更新] 通过镜像站获取 Release 成功: " + mirror);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static void UpdateCheckThreadProcLinux() {
+        const auto& config = Core::Config::Instance();
+        const int delayMs = config.updates.check_delay_ms > 0 ? config.updates.check_delay_ms : 15000;
+        std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+
+        Core::Logger::Info("[更新] 后台 GitHub Release 检查已启动 (Linux)");
+        std::string body;
+        if (!QueryLatestReleaseJsonLinux(&body)) {
+            Core::Logger::Info("[更新] 未能获取 GitHub Release 信息，本次静默跳过");
+            return;
+        }
+
+        LatestReleaseInfo release;
+        if (!ParseLatestRelease(body, &release)) {
+            Core::Logger::Info("[更新] Release 信息解析失败，本次静默跳过");
+            return;
+        }
+
+        const std::string currentVersion = NormalizeVersionText(config.buildVersion.empty() ? "0" : config.buildVersion);
+        const int cmp = CompareVersions(currentVersion, release.tagName);
+        Core::Logger::Info("[更新] 当前版本=" + currentVersion + ", 最新版本=" + release.tagName);
+        if (cmp >= 0) {
+            return;
+        }
+
+        if (HasNotifiedRelease(release.tagName)) {
+            Core::Logger::Info("[更新] 新版本 " + release.tagName + " 已提醒过，本次不重复提示");
+            return;
+        }
+
+        Core::Logger::Info("[更新] 🎉 发现新版本 " + release.tagName + "！下载页面: " + release.htmlUrl);
+        if (!release.name.empty() && release.name != release.tagName) {
+            Core::Logger::Info("[更新] 发布说明: " + release.name);
+        }
+
+        // 桌面环境提示 (若 notify-send 可用)
+        if (std::getenv("DISPLAY") || std::getenv("WAYLAND_DISPLAY")) {
+            std::string notifyCmd = "notify-send -a 'Antigravity' 'Antigravity-Proxy 发现新版本' '最新版本: " +
+                                    release.tagName + "\\n请前往 GitHub 页面下载更新。' 2>/dev/null";
+            int ret = system(notifyCmd.c_str());
+            (void)ret;
+        }
+
+        MarkReleaseNotified(release.tagName);
+    }
+} // anonymous namespace
 
 namespace UpdateChecker {
     void StartAsync() {
         const auto& config = Core::Config::Instance();
         if (!config.updates.enabled) return;
-        if (Core::Logger::IsEnabled(Core::LogLevel::Debug)) {
-            Core::Logger::Debug("[更新] Linux 自动更新检查未启用。");
+
+        if (g_linuxStarted.exchange(true)) {
+            return;
         }
+
+        std::thread t(UpdateCheckThreadProcLinux);
+        t.detach();
     }
 }
 #endif

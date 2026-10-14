@@ -12,6 +12,7 @@
 #include "network/FakeIP.hpp"
 #include "network/LocalTargetPolicy.hpp"
 #include "network/SocketFamily.hpp"
+#include "network/Socks5Udp.hpp"
 #include "hooks/ProcessName.hpp"
 
 int main() {
@@ -63,6 +64,34 @@ int main() {
         Network::DualStackResult dsRes = Network::EnsureIpv6DualStack(s6, AF_INET6, &err);
         assert(dsRes == Network::DualStackResult::Enabled || dsRes == Network::DualStackResult::AlreadyEnabled);
         closesocket(s6);
+    }
+
+    // 6. SOCKS5 UDP Wrap / Unwrap verification
+    {
+        const std::string host = "127.0.0.1";
+        const uint16_t port = 8080;
+        const char payload[] = "PING_UDP_TEST";
+        const size_t payloadLen = sizeof(payload);
+
+        std::vector<uint8_t> packet;
+        bool wrapOk = Network::Socks5Udp::Wrap(host, port, reinterpret_cast<const uint8_t*>(payload), payloadLen, &packet);
+        assert(wrapOk);
+        assert(packet.size() > payloadLen);
+
+        Network::Socks5Udp::UnwrapResult unwrap{};
+        bool unwrapOk = Network::Socks5Udp::Unwrap(packet.data(), packet.size(), &unwrap);
+        assert(unwrapOk);
+        assert(unwrap.payloadLen == payloadLen);
+        assert(std::memcmp(unwrap.payload, payload, payloadLen) == 0);
+
+        // Domain wrap & unwrap
+        const std::string domainHost = "dns.google";
+        std::vector<uint8_t> domainPacket;
+        assert(Network::Socks5Udp::Wrap(domainHost, 443, reinterpret_cast<const uint8_t*>("QUIC_HELLO"), 10, &domainPacket));
+        Network::Socks5Udp::UnwrapResult domainUnwrap{};
+        assert(Network::Socks5Udp::Unwrap(domainPacket.data(), domainPacket.size(), &domainUnwrap));
+        assert(domainUnwrap.payloadLen == 10);
+        assert(std::memcmp(domainUnwrap.payload, "QUIC_HELLO", 10) == 0);
     }
 
     std::cout << "✅ [Test] All Linux integration tests passed successfully!\n";

@@ -78,18 +78,40 @@ std::string FindIdePath() {
     if (const char* envPath = getenv("ANTIGRAVITY_IDE_PATH")) {
         if (FileExists(envPath)) return envPath;
     }
-    std::vector<std::string> candidates = {
-        "/usr/bin/antigravity",
-        "/usr/local/bin/antigravity",
-        "/opt/Antigravity/antigravity",
-        "/opt/antigravity/antigravity",
-        "/usr/share/antigravity/antigravity"
-    };
+    std::vector<std::string> candidates;
     const char* home = getenv("HOME");
     if (home) {
+        candidates.push_back(std::string(home) + "/Applications/Antigravity IDE/antigravity-ide");
+        candidates.push_back(std::string(home) + "/.local/bin/antigravity-ide");
+    }
+    candidates.push_back("/opt/Antigravity-IDE/antigravity-ide");
+    candidates.push_back("/opt/antigravity-ide/antigravity-ide");
+    candidates.push_back("/usr/local/bin/antigravity-ide");
+    candidates.push_back("/usr/bin/antigravity-ide");
+
+    for (const auto& c : candidates) {
+        if (FileExists(c)) return c;
+    }
+    return "antigravity-ide";
+}
+
+std::string FindAppPath() {
+    if (const char* envPath = getenv("ANTIGRAVITY_PATH")) {
+        if (FileExists(envPath)) return envPath;
+    }
+    std::vector<std::string> candidates;
+    const char* home = getenv("HOME");
+    if (home) {
+        candidates.push_back(std::string(home) + "/Applications/Antigravity-x64/antigravity");
+        candidates.push_back(std::string(home) + "/Applications/antigravity/antigravity");
         candidates.push_back(std::string(home) + "/.local/share/antigravity/antigravity");
         candidates.push_back(std::string(home) + "/.local/bin/antigravity");
     }
+    candidates.push_back("/opt/Antigravity/antigravity");
+    candidates.push_back("/opt/antigravity/antigravity");
+    candidates.push_back("/usr/local/bin/antigravity");
+    candidates.push_back("/usr/bin/antigravity");
+
     for (const auto& c : candidates) {
         if (FileExists(c)) return c;
     }
@@ -100,15 +122,21 @@ void PrintUsage(const char* prog) {
     std::cout << "🚀 Antigravity-Proxy Linux 管理与启动工具\n\n"
               << "用法:\n"
               << "  " << prog << " run <命令> [参数...]     通过代理运行指定命令\n"
-              << "  " << prog << " ide [参数...]            通过代理启动 Antigravity IDE (桌面端/编辑器)\n"
+              << "  " << prog << " ide [参数...]            通过代理启动 Antigravity IDE (开发环境)\n"
+              << "  " << prog << " app [参数...]            通过代理启动 Antigravity 智能体桌面端客户端\n"
               << "  " << prog << " agy [参数...]            通过代理运行 Antigravity CLI (agy)\n"
               << "  " << prog << " env                     输出注入环境变量 (用于 eval \"$(" << prog << " env)\")\n"
               << "  " << prog << " status                  显示当前代理配置与环境状态\n"
               << "  " << prog << " test                    测试代理服务器连通性\n"
-              << "  " << prog << " patch-desktop           为 Linux 桌面菜单图标生成/注入代理启动项\n"
+              << "  " << prog << " patch-desktop           自动检测并生成带代理的桌面启动项 (.desktop)\n"
               << "  " << prog << " help                    显示此帮助信息\n\n"
+              << "环境变量支持:\n"
+              << "  ANTIGRAVITY_IDE_PATH                   指定 Antigravity IDE 可执行文件路径\n"
+              << "  ANTIGRAVITY_PATH                       指定 Antigravity 桌面端客户端可执行文件路径\n"
+              << "  ANTIGRAVITY_CLI_PATH                   指定 Antigravity CLI (agy) 可执行文件路径\n\n"
               << "示例:\n"
-              << "  " << prog << " ide                      # 启动 Antigravity IDE (自动透明走代理)\n"
+              << "  " << prog << " ide                      # 启动 Antigravity IDE\n"
+              << "  " << prog << " app                      # 启动 Antigravity 桌面端客户端\n"
               << "  " << prog << " agy --version            # 运行 Antigravity CLI\n"
               << "  " << prog << " run curl -I https://www.google.com\n"
               << "  eval \"$(" << prog << " env)\" && antigravity\n";
@@ -144,6 +172,21 @@ int RunWithProxy(const std::string& soPath, const std::string& cmd, const std::v
     return 127;
 }
 
+std::string ExtractIconFromDesktop(const std::string& desktopPath) {
+    if (!FileExists(desktopPath)) return "";
+    std::ifstream f(desktopPath);
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.rfind("Icon=", 0) == 0) {
+            std::string icon = line.substr(5);
+            // 去除空白
+            while (!icon.empty() && (icon.back() == '\r' || icon.back() == ' ')) icon.pop_back();
+            if (!icon.empty()) return icon;
+        }
+    }
+    return "";
+}
+
 int PatchDesktopEntry(const std::string& soPath) {
     const char* home = getenv("HOME");
     std::string userApps = home ? (std::string(home) + "/.local/share/applications") : "";
@@ -153,35 +196,133 @@ int PatchDesktopEntry(const std::string& soPath) {
     }
     mkdir(userApps.c_str(), 0755);
 
-    std::string destDesktop = userApps + "/antigravity-proxied.desktop";
-    std::string idePath = FindIdePath();
+    std::string exeDir = GetExecutableDir();
+    int patchedCount = 0;
 
-    std::ofstream f(destDesktop);
-    if (!f.is_open()) {
-        std::cerr << "❌ 无法写入桌面快捷方式: " << destDesktop << "\n";
+    // 1. 处理 Antigravity IDE
+    std::string idePath = FindIdePath();
+    bool ideFound = FileExists(idePath);
+    std::string ideScript = exeDir + "/antigravity-ide.sh";
+    bool ideScriptFound = FileExists(ideScript);
+
+    if (ideFound || ideScriptFound) {
+        std::string ideDesktop = userApps + "/antigravity-ide-proxied.desktop";
+        std::string execCmd;
+        if (ideScriptFound) {
+            execCmd = ideScript + " %F";
+        } else {
+            execCmd = idePath + " %F";
+        }
+
+        // 图标探测
+        std::string ideIcon = ExtractIconFromDesktop(userApps + "/antigravity-ide.desktop");
+        if (ideIcon.empty() && home) {
+            std::vector<std::string> iconCandidates = {
+                std::string(home) + "/Applications/Antigravity IDE/antigravity-ide.png",
+                std::string(home) + "/Applications/Antigravity IDE/resources/app/resources/linux/code.png",
+                std::string(home) + "/.icons/antigravity-ide.png",
+                std::string(home) + "/Applications/.icons/antigravity-ide.png"
+            };
+            for (const auto& ic : iconCandidates) {
+                if (FileExists(ic)) { ideIcon = ic; break; }
+            }
+        }
+        if (ideIcon.empty()) ideIcon = "antigravity-ide";
+
+        std::ofstream f(ideDesktop);
+        if (f.is_open()) {
+            f << "[Desktop Entry]\n"
+              << "Version=1.0\n"
+              << "Type=Application\n"
+              << "Name=Antigravity IDE (Proxied)\n"
+              << "Name[zh_CN]=Antigravity IDE (代理版)\n"
+              << "Comment=Antigravity IDE with Transparent Proxy\n"
+              << "Comment[zh_CN]=Antigravity IDE 开发环境 (带透明代理)\n"
+              << "Exec=" << execCmd << "\n"
+              << "Icon=" << ideIcon << "\n"
+              << "StartupNotify=true\n"
+              << "StartupWMClass=antigravity-ide\n"
+              << "Categories=Development;IDE;TextEditor;\n";
+            f.close();
+            std::cout << "✅ 成功生成 IDE 代理桌面启动项: " << ideDesktop << "\n";
+            patchedCount++;
+        }
+    } else {
+        std::cout << "ℹ️ 未检测到 Antigravity IDE，跳过生成 antigravity-ide-proxied.desktop (可通过 ANTIGRAVITY_IDE_PATH 指定)\n";
+    }
+
+    // 2. 处理 Antigravity 桌面客户端
+    std::string appPath = FindAppPath();
+    bool appFound = FileExists(appPath);
+    std::string appScript = exeDir + "/antigravity.sh";
+    bool appScriptFound = FileExists(appScript);
+
+    if (appFound || appScriptFound) {
+        std::string appDesktop = userApps + "/antigravity-proxied.desktop";
+        std::string execCmd;
+        if (appScriptFound) {
+            execCmd = appScript + " %U";
+        } else {
+            execCmd = appPath + " %U";
+        }
+
+        // 图标探测
+        std::string appIcon = ExtractIconFromDesktop(userApps + "/antigravity.desktop");
+        if (appIcon.empty() && home) {
+            std::vector<std::string> iconCandidates = {
+                std::string(home) + "/Applications/Antigravity-x64/antigravity.png",
+                std::string(home) + "/Applications/.icons/antigravity.png",
+                std::string(home) + "/.icons/antigravity.png"
+            };
+            for (const auto& ic : iconCandidates) {
+                if (FileExists(ic)) { appIcon = ic; break; }
+            }
+        }
+        if (appIcon.empty()) appIcon = "antigravity";
+
+        std::ofstream f(appDesktop);
+        if (f.is_open()) {
+            f << "[Desktop Entry]\n"
+              << "Version=1.0\n"
+              << "Type=Application\n"
+              << "Name=Antigravity (Proxied)\n"
+              << "Name[zh_CN]=Antigravity (代理版)\n"
+              << "Comment=Antigravity Agentic Desktop Application with Transparent Proxy\n"
+              << "Comment[zh_CN]=Antigravity 智能体桌面应用 (带透明代理)\n"
+              << "Exec=" << execCmd << "\n"
+              << "Icon=" << appIcon << "\n"
+              << "StartupNotify=true\n"
+              << "StartupWMClass=antigravity\n"
+              << "Categories=Development;Utility;\n";
+            f.close();
+            std::cout << "✅ 成功生成桌面端代理桌面启动项: " << appDesktop << "\n";
+            patchedCount++;
+        }
+    } else {
+        std::cout << "ℹ️ 未检测到 Antigravity 桌面端，跳过生成 antigravity-proxied.desktop (可通过 ANTIGRAVITY_PATH 指定)\n";
+    }
+
+    if (patchedCount == 0) {
+        std::cerr << "⚠️ 未检测到任何 Antigravity 应用，未能生成桌面快捷方式。\n"
+                  << "可通过环境变量指定绝对路径后重试，例如:\n"
+                  << "  ANTIGRAVITY_IDE_PATH=/path/to/antigravity-ide ANTIGRAVITY_PATH=/path/to/antigravity "
+                  << "antigravity-proxy patch-desktop\n";
         return 1;
     }
 
-    f << "[Desktop Entry]\n"
-      << "Name=Antigravity (Proxied)\n"
-      << "Comment=Antigravity Editor with Transparent Proxy\n"
-      << "GenericName=Text Editor\n"
-      << "Exec=env LD_PRELOAD=\"" << soPath << "\" " << idePath << " %F\n"
-      << "Icon=antigravity\n"
-      << "Type=Application\n"
-      << "StartupNotify=true\n"
-      << "StartupWMClass=Antigravity\n"
-      << "Categories=Development;TextEditor;IDE;\n";
-    f.close();
-
-    std::cout << "✅ 成功生成带代理的桌面启动项: " << destDesktop << "\n"
-              << "现在你可以直接在 Linux 应用启动器中搜索并点击 'Antigravity (Proxied)' 启动。\n";
+    std::cout << "🎉 桌面启动项处理完成 (共生成 " << patchedCount << " 个项)。\n";
     return 0;
 }
 
 } // namespace
 
 int main(int argc, char* argv[]) {
+    std::string exeDir = GetExecutableDir();
+    std::string defaultCfg = exeDir + "/config.json";
+    if (!getenv("ANTIGRAVITY_PROXY_CONFIG") && FileExists(defaultCfg)) {
+        setenv("ANTIGRAVITY_PROXY_CONFIG", defaultCfg.c_str(), 1);
+    }
+
     if (argc < 2) {
         PrintUsage(argv[0]);
         return 0;
@@ -211,6 +352,8 @@ int main(int argc, char* argv[]) {
         std::cout << "检测到 agy: " << agyPath << " [" << (FileExists(agyPath) ? "存在" : "未找到/PATH fallback") << "]\n";
         std::string idePath = FindIdePath();
         std::cout << "检测到 IDE: " << idePath << " [" << (FileExists(idePath) ? "存在" : "未找到/PATH fallback") << "]\n";
+        std::string appPath = FindAppPath();
+        std::cout << "检测到桌面端: " << appPath << " [" << (FileExists(appPath) ? "存在" : "未找到/PATH fallback") << "]\n";
 
         Core::Config::Instance().Load();
         const auto& cfg = Core::Config::Instance();
@@ -272,15 +415,54 @@ int main(int argc, char* argv[]) {
     if (action == "ide") {
         std::string ide = FindIdePath();
         std::vector<std::string> args;
+        Core::Config::Instance().Load();
+        const auto& cfg = Core::Config::Instance();
+        if (cfg.proxy.port != 0) {
+            std::string scheme = cfg.proxy.type.empty() ? "socks5" : cfg.proxy.type;
+            std::string proxyUrl = scheme + "://" + cfg.proxy.host + ":" + std::to_string(cfg.proxy.port);
+            args.push_back("--proxy-server=" + proxyUrl);
+            args.push_back("--proxy-bypass-list=localhost;127.0.0.1;::1;<-loopback>");
+        }
         for (int i = 2; i < argc; ++i) {
             args.push_back(argv[i]);
         }
         return RunWithProxy(soPath, ide, args);
     }
 
+    if (action == "app" || action == "antigravity") {
+        std::string app = FindAppPath();
+        std::vector<std::string> args;
+        Core::Config::Instance().Load();
+        const auto& cfg = Core::Config::Instance();
+        if (cfg.proxy.port != 0) {
+            std::string scheme = cfg.proxy.type.empty() ? "socks5" : cfg.proxy.type;
+            std::string proxyUrl = scheme + "://" + cfg.proxy.host + ":" + std::to_string(cfg.proxy.port);
+            args.push_back("--proxy-server=" + proxyUrl);
+            args.push_back("--proxy-bypass-list=localhost;127.0.0.1;::1;<-loopback>");
+        }
+        for (int i = 2; i < argc; ++i) {
+            args.push_back(argv[i]);
+        }
+        return RunWithProxy(soPath, app, args);
+    }
+
     if (action == "agy") {
         std::string agy = FindAgyPath();
         std::vector<std::string> args;
+        Core::Config::Instance().Load();
+        const auto& cfg = Core::Config::Instance();
+        if (cfg.proxy.port != 0) {
+            std::string scheme = cfg.proxy.type.empty() ? "socks5" : cfg.proxy.type;
+            std::string proxyUrl = scheme + "://" + cfg.proxy.host + ":" + std::to_string(cfg.proxy.port);
+            setenv("ALL_PROXY", proxyUrl.c_str(), 1);
+            setenv("all_proxy", proxyUrl.c_str(), 1);
+            setenv("HTTP_PROXY", proxyUrl.c_str(), 1);
+            setenv("http_proxy", proxyUrl.c_str(), 1);
+            setenv("HTTPS_PROXY", proxyUrl.c_str(), 1);
+            setenv("https_proxy", proxyUrl.c_str(), 1);
+            setenv("NO_PROXY", "localhost,127.0.0.1,::1", 1);
+            setenv("no_proxy", "localhost,127.0.0.1,::1", 1);
+        }
         for (int i = 2; i < argc; ++i) {
             args.push_back(argv[i]);
         }

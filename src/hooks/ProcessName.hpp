@@ -3,7 +3,13 @@
 #include <algorithm>
 #include <cctype>
 #include <string>
+#include <string_view>
 #include <utility>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+#endif
 
 namespace Hooks {
 
@@ -89,5 +95,54 @@ inline bool IsAntigravityHostProcessName(const std::string& processName) {
     return lowerName == "antigravity.exe" ||
            lowerName == "antigravity ide.exe";
 }
+
+#ifndef _WIN32
+inline bool IsChromiumSandboxedProcessType(std::string_view typeArg) {
+    // 检查是否为已知被 seccomp-bpf 严格沙箱化的子进程类型
+    // 这些进程严禁触发未授权网络系统调用（如 getsockopt, socket 等），
+    // 且其网络请求完全由 Chromium 浏览器/网络主进程统筹中转，绝不应注入代理或拦截
+    return typeArg.rfind("--type=renderer", 0) == 0 ||
+           typeArg.rfind("--type=gpu-process", 0) == 0 ||
+           typeArg.rfind("--type=zygote", 0) == 0 ||
+           typeArg.rfind("--type=crashpad-handler", 0) == 0;
+}
+
+inline bool IsCurrentProcessChromiumSandboxed() {
+    static int s_isSandboxed = -1;
+    if (s_isSandboxed != -1) return s_isSandboxed == 1;
+
+    // 先设为 0，防止内部调用时发生任何重入递归
+    s_isSandboxed = 0;
+
+    int fd = static_cast<int>(::syscall(SYS_openat, AT_FDCWD, "/proc/self/cmdline", O_RDONLY | O_CLOEXEC));
+    if (fd >= 0) {
+        char buf[4096] = {0};
+        ssize_t n = ::syscall(SYS_read, fd, buf, sizeof(buf) - 1);
+        ::syscall(SYS_close, fd);
+        if (n > 0) {
+            const char* p = buf;
+            while (p < buf + n) {
+                std::string_view arg(p);
+                if (IsChromiumSandboxedProcessType(arg)) {
+                    s_isSandboxed = 1;
+                    return true;
+                }
+                p += arg.size() + 1;
+            }
+        }
+    }
+    return false;
+}
+
+inline bool IsChildArgvChromiumSandboxed(char* const argv[]) {
+    if (!argv) return false;
+    for (size_t i = 0; argv[i] != nullptr; ++i) {
+        if (IsChromiumSandboxedProcessType(argv[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+#endif
 
 } // namespace Hooks
